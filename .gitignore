@@ -7,3 +7,6 @@ result-man
 
 # VS Code
 .vscode/
+
+# Experimental Files
+/tmp/
