@@ -86,6 +86,7 @@ impl std::fmt::Display for NodeEdge {
 pub trait NodeEdgeRef<'a> {
     fn index(self) -> Option<Ref<'a, str>>;
 
+    #[expect(unused)]
     fn path(self) -> Option<Ref<'a, Vec<String>>>;
 }
 
@@ -150,6 +151,7 @@ impl Node {
         self.edges().get(name.as_ref()).map(|cell| cell.borrow())
     }
 
+    #[expect(unused)]
     pub fn get_edge_mut(&self, name: impl AsRef<str>) -> Option<RefMut<NodeEdge>> {
         self.edges()
             .get(name.as_ref())
@@ -158,6 +160,7 @@ impl Node {
 }
 
 impl LockFile {
+    #[expect(unused)]
     pub fn new() -> Self {
         static ROOT: &str = "root";
         Self {
@@ -192,6 +195,7 @@ impl LockFile {
         self.nodes.get(index.as_ref()).map(RefCell::borrow)
     }
 
+    #[expect(unused)]
     pub fn get_node_mut(&self, index: impl AsRef<str>) -> Option<RefMut<Node>> {
         self.nodes.get(index.as_ref()).map(RefCell::borrow_mut)
     }
