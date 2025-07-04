@@ -1,15 +1,13 @@
 { lib, pkgs, rust-bin, mkShell, packageName }:
-let
-  rust-stable = rust-bin.stable.latest.minimal.override {
-    extensions = [ "rust-src" "rust-docs" "clippy" ];
-  };
-in mkShell {
+mkShell {
   strictDeps = true;
   inputsFrom = [ pkgs.${packageName} ];
   packages = [
     # Derivations in `rust-stable` provide the toolchain,
     # must be listed first to take precedence over nightly.
-    rust-stable
+    (rust-bin.stable.latest.minimal.override {
+      extensions = [ "rust-src" "rust-docs" "clippy" ];
+    })
 
     # Use rustfmt, and other tools that require nightly features.
     (rust-bin.selectLatestNightlyWith (toolchain:
