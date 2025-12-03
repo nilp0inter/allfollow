@@ -2,6 +2,7 @@ mod cli_args;
 mod flake_lock;
 mod fmt_colors;
 
+use std::io::Write;
 use std::iter::repeat;
 
 use bpaf::Bpaf;
@@ -57,6 +58,13 @@ enum Command {
         #[bpaf(positional("INPUT"), fallback(Input::from("./flake.lock")))]
         lock_file: Input,
     },
+    #[bpaf(command("config"))]
+    Config {
+        /// The path of `flake.lock` to read, or `-` to read from standard input.
+        /// If unspecified, defaults to the current directory.
+        #[bpaf(positional("INPUT"), fallback(Input::from("./flake.lock")))]
+        lock_file: Input,
+    },
 }
 
 /// Generic options for output handling:
@@ -93,6 +101,7 @@ impl Command {
                     output_opts.overwrite = true;
                 }
             }
+            Command::Config { .. } => {}
         };
         args
     }
@@ -149,6 +158,11 @@ fn main() {
             } else {
                 logln!(:bold :bright_magenta "Flake input nodes' reference counts:"; &node_hits)
             }
+        }
+        Command::Config { lock_file } => {
+            let lock = read_flake_lock(lock_file);
+            let mut stdout = std::io::stdout().lock();
+            print_flake_follows_config(&lock, &mut stdout);
         }
     }
 }
@@ -260,6 +274,83 @@ fn recurse_inputs(lock: &LockFile, index: String, op: &mut impl FnMut(String)) {
     }
 }
 
+fn print_flake_follows_config(lock: &LockFile, writer: &mut impl Write) {
+    let root = lock.root().expect(EXPECT_ROOT_EXIST);
+    // Identify root inputs
+    let root_inputs: std::collections::HashSet<String> = root
+        .iter_edges()
+        .map(|(name, _)| name.to_string())
+        .collect();
+
+    // Start traversal from root inputs
+    for (input_name, edge) in root.iter_edges() {
+        if let Some(index) = edge.index() {
+            traverse_and_print_config(
+                lock,
+                &root_inputs,
+                &index,
+                vec![input_name.to_string()],
+                &mut vec![index.to_string()],
+                writer,
+            );
+        }
+    }
+}
+
+fn traverse_and_print_config(
+    lock: &LockFile,
+    root_inputs: &std::collections::HashSet<String>,
+    current_node_index: &str,
+    current_path: Vec<String>,
+    visited_indices: &mut Vec<String>, // To detect cycles in the current path
+    writer: &mut impl Write,
+) {
+    let node = lock.get_node(current_node_index).expect("node exists");
+
+    for (edge_name, edge) in node.iter_edges() {
+        // If the edge name matches a root input, print the config
+        if root_inputs.contains(edge_name) {
+            let mut config_path = current_path.clone();
+            config_path.push(edge_name.to_string());
+            // Construct string like B.inputs.C.inputs.nixpkgs.follows = "nixpkgs"
+            // Path elements join with ".inputs."
+            let path_str = config_path.join(".inputs.");
+            writeln!(writer, "{}.follows = \"{}\"", path_str, edge_name).ok();
+
+            // If we are configuring it to follow, we essentially stop traversing this branch *as if* it was the root input.
+            // But wait, the task is to print the config.
+            // If I set `B.inputs.C.inputs.nixpkgs.follows = "nixpkgs"`, then `B.inputs.C` will use the root `nixpkgs`.
+            // Do I need to traverse further into `nixpkgs`? No, because `nixpkgs` (root) inputs are already configured at the top level?
+            // Or because `nixpkgs` usually doesn't have inputs we want to override?
+            // If `nixpkgs` has inputs, say `nixpkgs` has `foobar`.
+            // `B.inputs.C.inputs.nixpkgs.inputs.foobar`?
+            // If `nixpkgs` is followed, `B.inputs.C.inputs.nixpkgs` IS `root.inputs.nixpkgs`.
+            // So any configuration for `root.inputs.nixpkgs` (which is `nixpkgs...`) applies.
+            // So we don't need to recurse further here.
+            continue;
+        }
+
+        // If not following a root input, we recurse.
+        if let Some(child_index) = lock.resolve_edge(&edge) {
+            if !visited_indices.contains(&child_index) {
+                visited_indices.push(child_index.clone());
+                let mut new_path = current_path.clone();
+                new_path.push(edge_name.to_string());
+                traverse_and_print_config(
+                    lock,
+                    root_inputs,
+                    &child_index,
+                    new_path,
+                    visited_indices,
+                    writer,
+                );
+                visited_indices.pop();
+            }
+        }
+    }
+}
+
+
 struct FlakeNodeVisits<'a> {
     inner: IndexMap<&'a str, u32>,
     // Index of the node which this count is relative to.
@@ -354,6 +445,26 @@ mod tests {
             },
             {
                 assert_json_snapshot!(&lock);
+            }
+        );
+    }
+
+    #[test]
+    fn config_hyprland_flake_lock() {
+        use crate::print_flake_follows_config;
+        let lock = read_flake_lock(HYPRLAND_LOCK_NO_FOLLOWS.into());
+        let mut buf = Vec::new();
+        print_flake_follows_config(&lock, &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        insta::with_settings!(
+            {
+                description => "Generated config for Hyprland's `flake.lock`.",
+                input_file => HYPRLAND_LOCK_NO_FOLLOWS,
+                omit_expression => true,
+                snapshot_path => "../tests/snapshots",
+            },
+            {
+                insta::assert_snapshot!(output);
             }
         );
     }
