@@ -64,6 +64,9 @@ enum Command {
         /// If unspecified, defaults to the current directory.
         #[bpaf(positional("INPUT"), fallback(Input::from("./flake.lock")))]
         lock_file: Input,
+        //
+        #[bpaf(external(output_options))]
+        output_opts: OutputOptions,
     },
 }
 
@@ -101,7 +104,19 @@ impl Command {
                     output_opts.overwrite = true;
                 }
             }
-            Command::Config { .. } => {}
+            Command::Config {
+                lock_file,
+                output_opts,
+            } => {
+                if output_opts.in_place {
+                    let nix_path = match lock_file {
+                        Input::File(p) => p.with_file_name("flake.nix"),
+                        Input::Stdin => std::path::PathBuf::from("flake.nix"),
+                    };
+                    output_opts.output = Output::File(nix_path);
+                    output_opts.overwrite = true;
+                }
+            }
         };
         args
     }
@@ -159,12 +174,75 @@ fn main() {
                 logln!(:bold :bright_magenta "Flake input nodes' reference counts:"; &node_hits)
             }
         }
-        Command::Config { lock_file } => {
+        Command::Config {
+            lock_file,
+            output_opts,
+        } => {
             let lock = read_flake_lock(lock_file);
-            let mut stdout = std::io::stdout().lock();
-            print_flake_follows_config(&lock, &mut stdout);
+            let mut buf = Vec::new();
+            print_flake_follows_config(&lock, &mut buf);
+
+            if output_opts.in_place {
+                let path = match output_opts.output {
+                    Output::File(p) => p,
+                    Output::Stdout => panic!("in-place with stdout?"),
+                };
+                update_flake_nix_inplace(&path, &buf);
+            } else {
+                let mut writer = output_opts
+                    .output
+                    .create(!output_opts.overwrite)
+                    .unwrap_or_else(|e| panic!("Could not write to output: {e}"));
+                writer.write_all(&buf).unwrap();
+            }
         }
     }
+}
+
+fn update_flake_nix_inplace(path: &std::path::Path, config_bytes: &[u8]) {
+    let mut file_content = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("Failed to read {}: {}", path.display(), e));
+
+    let start_marker = "# START INPUT FOLLOW BLOCK";
+    let end_marker = "# END INPUT FOLLOW BLOCK";
+
+    let start_idx = file_content.find(start_marker).unwrap_or_else(|| {
+        panic!(
+            "Could not find start marker '{}' in {}",
+            start_marker,
+            path.display()
+        )
+    });
+    let end_idx = file_content.find(end_marker).unwrap_or_else(|| {
+        panic!(
+            "Could not find end marker '{}' in {}",
+            end_marker,
+            path.display()
+        )
+    });
+
+    if start_idx >= end_idx {
+        panic!(
+            "Start marker is after end marker in {}",
+            path.display()
+        );
+    }
+
+    let config_str = std::str::from_utf8(config_bytes).expect("Config is not valid UTF-8");
+
+    let new_content = format!(
+        "{}\n{}\n{}",
+        &file_content[..start_idx + start_marker.len()],
+        config_str.trim(),
+        &file_content[end_idx..]
+    );
+
+    let mut file = std::fs::File::create(path)
+        .unwrap_or_else(|e| panic!("Failed to open {} for writing: {}", path.display(), e));
+    file.write_all(new_content.as_bytes())
+        .unwrap_or_else(|e| panic!("Failed to write to {}: {}", path.display(), e));
+
+    elogln!(:bold :green "Successfully updated", :italic :dimmed (path.display()));
 }
 
 fn read_flake_lock(lock_file: Input) -> LockFile {
