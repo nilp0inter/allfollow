@@ -2,6 +2,7 @@ mod cli_args;
 mod flake_lock;
 mod fmt_colors;
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::iter::repeat;
 
@@ -349,16 +350,23 @@ fn serialize_to_json_output(value: impl Serialize, output: Output, overwrite: bo
 fn substitute_flake_inputs_with_follows(lock: &LockFile, indexed: bool) {
     elogln!(:bold :bright_magenta "Redirecting inputs to imitate follows behavior.");
 
-    let root = lock.root().expect(EXPECT_ROOT_EXIST);
-    for (input_name, input_index) in root
-        .iter_edges()
-        .filter_map(|(name, edge)| edge.index().map(|index| (name, index)))
-    {
+    let root_input_indices: Vec<(String, String)> = {
+        let root = lock.root().expect(EXPECT_ROOT_EXIST);
+        root.iter_edges()
+            .filter_map(|(name, edge)| edge.index().map(|index| (name.to_string(), index.to_string())))
+            .collect()
+    };
+
+    let mut visited: HashSet<String> = HashSet::new();
+    for (input_name, input_index) in root_input_indices {
         elogln!(:bold (:bright_cyan "Replacing inputs for", :green "'{input_name}'"), :dimmed "(" :dimmed :italic "'{input_index}'" :dimmed ")");
+        if !visited.insert(input_index.clone()) {
+            continue;
+        }
         let input = &*lock
-            .get_node(&*input_index)
+            .get_node(&input_index)
             .expect("a node to exist with this index");
-        substitute_node_inputs_with_root_inputs(lock, input, indexed);
+        substitute_node_inputs_with_root_inputs(lock, input, indexed, &mut visited);
     }
 }
 
@@ -367,22 +375,51 @@ fn substitute_flake_inputs_with_follows(lock: &LockFile, indexed: bool) {
 ///
 /// Otherwise, if `indexed == true`, the each input replacement will be cloned
 /// verbatim from the root node, most likely retaining a `NodeEdge::Indexed`.
-fn substitute_node_inputs_with_root_inputs(lock: &LockFile, node: &Node, indexed: bool) {
-    let root = lock.root().expect(EXPECT_ROOT_EXIST);
-    for (edge_name, mut edge) in node.iter_edges_mut() {
-        if let Some(root_edge) = root.get_edge(edge_name) {
-            if indexed {
-                let old = std::mem::replace(&mut *edge, (*root_edge).clone());
-                elogln!("-", :yellow "'{edge_name}'", "now references", :italic :purple "'{edge}'", :dimmed "(was '{old}')");
+///
+/// Recurses into each non-substituted edge's target so that transitive
+/// descendants (e.g. `home-manager.inputs.git-hooks-nix.inputs.nixpkgs`)
+/// also get rewritten to follow root, not only direct children. `visited`
+/// breaks cycles and prevents exponential-path walks in shared subtrees.
+fn substitute_node_inputs_with_root_inputs(
+    lock: &LockFile,
+    node: &Node,
+    indexed: bool,
+    visited: &mut HashSet<String>,
+) {
+    // First pass: rewrite this node's edges in place. Collect targets of
+    // edges we did NOT substitute, so we can recurse into them after we've
+    // released the iter_edges_mut RefMut borrows.
+    let mut descend_into: Vec<String> = Vec::new();
+    {
+        let root = lock.root().expect(EXPECT_ROOT_EXIST);
+        for (edge_name, mut edge) in node.iter_edges_mut() {
+            if let Some(root_edge) = root.get_edge(edge_name) {
+                if indexed {
+                    let old = std::mem::replace(&mut *edge, (*root_edge).clone());
+                    elogln!("-", :yellow "'{edge_name}'", "now references", :italic :purple "'{edge}'", :dimmed "(was '{old}')");
+                } else {
+                    let old = std::mem::replace(&mut *edge, NodeEdge::from_iter([edge_name]));
+                    elogln!("-", :yellow "'{edge_name}'", "now follows", :green "'{edge}'", :dimmed "(was '{old}')");
+                }
             } else {
-                let old = std::mem::replace(&mut *edge, NodeEdge::from_iter([edge_name]));
-                elogln!("-", :yellow "'{edge_name}'", "now follows", :green "'{edge}'", :dimmed "(was '{old}')");
+                if let Some(target_index) = lock.resolve_edge(&edge) {
+                    elogln!(
+                        :bold (:cyan "No suitable replacement for", :yellow "'{edge_name}'"),
+                        :dimmed "(" :dimmed :italic ("'{target_index}'") :dimmed ")"
+                    );
+                    descend_into.push(target_index);
+                }
             }
-        } else {
-            elogln!(
-                :bold (:cyan "No suitable replacement for", :yellow "'{edge_name}'"),
-                :dimmed "(" :dimmed :italic ("'" (lock.resolve_edge(&edge).unwrap()) "'") :dimmed ")"
-            );
+        }
+    }
+
+    // Second pass: recurse into descendants we haven't visited yet.
+    for target_index in descend_into {
+        if !visited.insert(target_index.clone()) {
+            continue;
+        }
+        if let Some(target) = lock.get_node(&target_index) {
+            substitute_node_inputs_with_root_inputs(lock, &*target, indexed, visited);
         }
     }
 }
@@ -406,12 +443,27 @@ fn prune_orphan_nodes(lock: &mut LockFile) {
 }
 
 fn recurse_inputs(lock: &LockFile, index: String, op: &mut impl FnMut(String)) {
-    let node = lock.get_node(&index).unwrap();
-    op(index);
-    for (_, edge) in node.iter_edges() {
-        let index = lock.resolve_edge(&edge).unwrap();
-        recurse_inputs(lock, index, op);
+    fn inner(
+        lock: &LockFile,
+        index: String,
+        visited: &mut HashSet<String>,
+        op: &mut impl FnMut(String),
+    ) {
+        // Count this edge into the node (every entry, including repeated ones).
+        op(index.clone());
+        // But only walk the node's descendants the first time we reach it,
+        // so transitive dep graphs with high reuse don't blow the stack.
+        if !visited.insert(index.clone()) {
+            return;
+        }
+        let node = lock.get_node(&index).unwrap();
+        for (_, edge) in node.iter_edges() {
+            let target = lock.resolve_edge(&edge).unwrap();
+            inner(lock, target, visited, op);
+        }
     }
+    let mut visited = HashSet::new();
+    inner(lock, index, &mut visited, op);
 }
 
 fn print_flake_follows_config(lock: &LockFile, writer: &mut impl Write) {
