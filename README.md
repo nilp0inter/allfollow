@@ -95,6 +95,19 @@ That change would result in the following in the lock file:
 This tool, `allfollow`, will effectively do the same as a post-process to your
 `flake.lock`.
 
+# Excluding inputs
+
+Some inputs intentionally need their own transitive dependency graph. Use
+`--exclude <PATH>` with `prune` or `config` to leave that root-relative input
+path, and all of its descendants, out of generated follows behavior.
+
+Paths may use `/` separators or the same `.inputs.` shape emitted by `config`:
+
+```sh
+allfollow prune --exclude hyprland-protocols/nixpkgs flake.lock
+allfollow config --exclude hyprland-protocols.inputs.nixpkgs flake.lock
+```
+
 # Okay, why?
 
 Large flakes that aggregate other packages need to add

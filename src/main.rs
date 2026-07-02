@@ -5,6 +5,7 @@ mod fmt_colors;
 use std::collections::HashSet;
 use std::io::Write;
 use std::iter::repeat;
+use std::str::FromStr;
 
 use bpaf::Bpaf;
 use cli_args::{Input, Output};
@@ -16,6 +17,78 @@ use indexmap::IndexMap;
 use owo_colors::OwoColorize;
 use serde::Serialize;
 use serde_json::Serializer;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InputPath(Vec<String>);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct InputPathExclusions {
+    paths: Vec<InputPath>,
+}
+
+impl InputPath {
+    fn as_slice(&self) -> &[String] {
+        &self.0
+    }
+
+    fn display(&self) -> String {
+        self.0.join("/")
+    }
+}
+
+impl FromStr for InputPath {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let separator = if value.contains(".inputs.") {
+            ".inputs."
+        } else {
+            "/"
+        };
+        let segments: Vec<String> = value.split(separator).map(str::to_owned).collect();
+
+        if segments.is_empty() || segments.iter().any(String::is_empty) {
+            return Err("input paths must contain non-empty segments".to_string());
+        }
+
+        Ok(Self(segments))
+    }
+}
+
+impl From<Vec<InputPath>> for InputPathExclusions {
+    fn from(paths: Vec<InputPath>) -> Self {
+        Self { paths }
+    }
+}
+
+impl InputPathExclusions {
+    fn excludes(&self, path: &[String]) -> bool {
+        self.paths
+            .iter()
+            .any(|excluded| path.starts_with(excluded.as_slice()))
+    }
+
+    fn assert_resolvable(&self, lock: &LockFile) {
+        for path in &self.paths {
+            if lock.follow_path(path.as_slice()).is_none() {
+                let path = path.display();
+                panic!("Excluded input path '{path}' does not exist in the lock file");
+            }
+        }
+    }
+
+    fn excluded_node_indices(&self, lock: &LockFile) -> HashSet<String> {
+        let mut excluded = HashSet::new();
+        for path in &self.paths {
+            if let Some(index) = lock.follow_path(path.as_slice()) {
+                recurse_inputs(lock, index, &mut |index| {
+                    excluded.insert(index);
+                });
+            }
+        }
+        excluded
+    }
+}
 
 static EXPECT_ROOT_EXIST: &str = "the root node to exist";
 
@@ -38,6 +111,10 @@ enum Command {
         //
         #[bpaf(external(output_options))]
         output_opts: OutputOptions,
+        /// Exclude this input path and its descendants from follows substitution.
+        /// Paths are slash-separated from the flake root, e.g. `foo/bar/nixpkgs`.
+        #[bpaf(short('x'), long("exclude"), argument("PATH"))]
+        excluded_inputs: Vec<InputPath>,
         /// The path of `flake.lock` to read, or `-` to read from standard input.
         /// If unspecified, defaults to the current directory.
         #[bpaf(positional("INPUT"), fallback(Input::from("./flake.lock")))]
@@ -67,6 +144,10 @@ enum Command {
     /// without re-introducing duplicate transitive nodes on every read.
     #[bpaf(command("config"))]
     Config {
+        /// Exclude this input path and its descendants from generated follows.
+        /// Paths are slash-separated from the flake root, e.g. `foo/bar/nixpkgs`.
+        #[bpaf(short('x'), long("exclude"), argument("PATH"))]
+        excluded_inputs: Vec<InputPath>,
         /// The path of `flake.lock` to read, or `-` to read from standard input.
         /// If unspecified, defaults to the current directory.
         #[bpaf(positional("INPUT"), fallback(Input::from("./flake.lock")))]
@@ -118,6 +199,7 @@ fn main() {
     match Command::from_env() {
         Command::Prune {
             no_follows,
+            excluded_inputs,
             lock_file,
             pretty,
             output_opts:
@@ -128,12 +210,14 @@ fn main() {
                 },
         } => {
             let mut lock = read_flake_lock(lock_file);
+            let excluded_inputs = InputPathExclusions::from(excluded_inputs);
+            excluded_inputs.assert_resolvable(&lock);
 
             let node_hits = FlakeNodeVisits::count_from_index(&lock, lock.root_index());
             eprintln!();
             elogln!(:bold :bright_magenta "Flake input nodes' reference counts:"; &node_hits);
 
-            substitute_flake_inputs_with_follows(&lock, no_follows);
+            substitute_flake_inputs_with_follows(&lock, no_follows, &excluded_inputs);
             eprintln!();
             prune_orphan_nodes(&mut lock);
 
@@ -166,11 +250,20 @@ fn main() {
                 logln!(:bold :bright_magenta "Flake input nodes' reference counts:"; &node_hits)
             }
         }
-        Command::Config { lock_file } => {
+        Command::Config {
+            lock_file,
+            excluded_inputs,
+        } => {
             let lock = read_flake_lock(lock_file);
+            let excluded_inputs = InputPathExclusions::from(excluded_inputs);
+            excluded_inputs.assert_resolvable(&lock);
+
             let mut buf = Vec::new();
-            print_flake_file_module(&lock, &mut buf);
-            print!("{}", String::from_utf8(buf).expect("config output to be utf8"));
+            print_flake_file_module(&lock, &excluded_inputs, &mut buf);
+            print!(
+                "{}",
+                String::from_utf8(buf).expect("config output to be utf8")
+            );
         }
     }
 }
@@ -214,18 +307,32 @@ fn serialize_to_json_output(value: impl Serialize, output: Output, overwrite: bo
     }
 }
 
-fn substitute_flake_inputs_with_follows(lock: &LockFile, indexed: bool) {
+fn substitute_flake_inputs_with_follows(
+    lock: &LockFile,
+    indexed: bool,
+    excluded_inputs: &InputPathExclusions,
+) {
     elogln!(:bold :bright_magenta "Redirecting inputs to imitate follows behavior.");
 
     let root_input_indices: Vec<(String, String)> = {
         let root = lock.root().expect(EXPECT_ROOT_EXIST);
         root.iter_edges()
-            .filter_map(|(name, edge)| edge.index().map(|index| (name.to_string(), index.to_string())))
+            .filter_map(|(name, edge)| {
+                edge.index()
+                    .map(|index| (name.to_string(), index.to_string()))
+            })
             .collect()
     };
+    let excluded_node_indices = excluded_inputs.excluded_node_indices(lock);
 
     let mut visited: HashSet<String> = HashSet::new();
     for (input_name, input_index) in root_input_indices {
+        let input_path = vec![input_name.clone()];
+        if excluded_inputs.excludes(&input_path) || excluded_node_indices.contains(&input_index) {
+            elogln!(:bold (:bright_cyan "Skipping excluded input", :green "'{input_name}'"), :dimmed "(" :dimmed :italic "'{input_index}'" :dimmed ")");
+            continue;
+        }
+
         elogln!(:bold (:bright_cyan "Replacing inputs for", :green "'{input_name}'"), :dimmed "(" :dimmed :italic "'{input_index}'" :dimmed ")");
         if !visited.insert(input_index.clone()) {
             continue;
@@ -233,7 +340,15 @@ fn substitute_flake_inputs_with_follows(lock: &LockFile, indexed: bool) {
         let input = &*lock
             .get_node(&input_index)
             .expect("a node to exist with this index");
-        substitute_node_inputs_with_root_inputs(lock, input, indexed, &mut visited);
+        substitute_node_inputs_with_root_inputs(
+            lock,
+            input,
+            indexed,
+            &input_path,
+            excluded_inputs,
+            &excluded_node_indices,
+            &mut visited,
+        );
     }
 }
 
@@ -251,15 +366,37 @@ fn substitute_node_inputs_with_root_inputs(
     lock: &LockFile,
     node: &Node,
     indexed: bool,
+    current_path: &[String],
+    excluded_inputs: &InputPathExclusions,
+    excluded_node_indices: &HashSet<String>,
     visited: &mut HashSet<String>,
 ) {
     // First pass: rewrite this node's edges in place. Collect targets of
     // edges we did NOT substitute, so we can recurse into them after we've
     // released the iter_edges_mut RefMut borrows.
-    let mut descend_into: Vec<String> = Vec::new();
+    let mut descend_into: Vec<(String, Vec<String>)> = Vec::new();
     {
         let root = lock.root().expect(EXPECT_ROOT_EXIST);
         for (edge_name, mut edge) in node.iter_edges_mut() {
+            let mut edge_path = current_path.to_vec();
+            edge_path.push(edge_name.to_string());
+
+            if excluded_inputs.excludes(&edge_path) {
+                let edge_path = InputPath(edge_path).display();
+                elogln!("-", :yellow "'{edge_path}'", "is excluded from follows substitution");
+                continue;
+            }
+
+            let target_index = lock.resolve_edge(&edge);
+            if target_index
+                .as_ref()
+                .is_some_and(|target_index| excluded_node_indices.contains(target_index))
+            {
+                let edge_path = InputPath(edge_path).display();
+                elogln!("-", :yellow "'{edge_path}'", "targets an excluded input subtree");
+                continue;
+            }
+
             if let Some(root_edge) = root.get_edge(edge_name) {
                 if indexed {
                     let old = std::mem::replace(&mut *edge, (*root_edge).clone());
@@ -268,25 +405,31 @@ fn substitute_node_inputs_with_root_inputs(
                     let old = std::mem::replace(&mut *edge, NodeEdge::from_iter([edge_name]));
                     elogln!("-", :yellow "'{edge_name}'", "now follows", :green "'{edge}'", :dimmed "(was '{old}')");
                 }
-            } else {
-                if let Some(target_index) = lock.resolve_edge(&edge) {
-                    elogln!(
-                        :bold (:cyan "No suitable replacement for", :yellow "'{edge_name}'"),
-                        :dimmed "(" :dimmed :italic ("'{target_index}'") :dimmed ")"
-                    );
-                    descend_into.push(target_index);
-                }
+            } else if let Some(target_index) = target_index {
+                elogln!(
+                    :bold (:cyan "No suitable replacement for", :yellow "'{edge_name}'"),
+                    :dimmed "(" :dimmed :italic ("'{target_index}'") :dimmed ")"
+                );
+                descend_into.push((target_index, edge_path));
             }
         }
     }
 
     // Second pass: recurse into descendants we haven't visited yet.
-    for target_index in descend_into {
+    for (target_index, target_path) in descend_into {
         if !visited.insert(target_index.clone()) {
             continue;
         }
         if let Some(target) = lock.get_node(&target_index) {
-            substitute_node_inputs_with_root_inputs(lock, &*target, indexed, visited);
+            substitute_node_inputs_with_root_inputs(
+                lock,
+                &*target,
+                indexed,
+                &target_path,
+                excluded_inputs,
+                excluded_node_indices,
+                visited,
+            );
         }
     }
 }
@@ -340,19 +483,31 @@ fn recurse_inputs(lock: &LockFile, index: String, op: &mut impl FnMut(String)) {
 /// `flake-file.inputs.<X>.inputs.<Y>.follows`. With those follows
 /// declared, nix evaluation no longer re-introduces the duplicate
 /// transitive nodes that allfollow's `prune` collapses.
-fn print_flake_file_module(lock: &LockFile, writer: &mut impl Write) {
-    writeln!(writer, "# DO-NOT-EDIT. This file was auto-generated by `allfollow config`.").ok();
+fn print_flake_file_module(
+    lock: &LockFile,
+    excluded_inputs: &InputPathExclusions,
+    writer: &mut impl Write,
+) {
+    writeln!(
+        writer,
+        "# DO-NOT-EDIT. This file was auto-generated by `allfollow config`."
+    )
+    .ok();
     writeln!(writer, "{{ ... }}:").ok();
     writeln!(writer, "{{").ok();
     writeln!(writer, "  flake-file.inputs = {{").ok();
-    print_follows_attrs(lock, writer);
+    print_follows_attrs(lock, excluded_inputs, writer);
     writeln!(writer, "  }};").ok();
     write!(writer, "}}").ok();
 }
 
 /// Walk root's direct inputs and emit `<input>.inputs.<...>.follows = "<...>";`
 /// assignments for every transitive edge whose name matches a root input.
-fn print_follows_attrs(lock: &LockFile, writer: &mut impl Write) {
+fn print_follows_attrs(
+    lock: &LockFile,
+    excluded_inputs: &InputPathExclusions,
+    writer: &mut impl Write,
+) {
     let root = lock.root().expect(EXPECT_ROOT_EXIST);
     let root_inputs: std::collections::HashSet<String> = root
         .iter_edges()
@@ -360,12 +515,18 @@ fn print_follows_attrs(lock: &LockFile, writer: &mut impl Write) {
         .collect();
 
     for (input_name, edge) in root.iter_edges() {
+        let current_path = vec![input_name.to_string()];
+        if excluded_inputs.excludes(&current_path) {
+            continue;
+        }
+
         if let Some(index) = edge.index() {
             traverse_and_print_config(
                 lock,
                 &root_inputs,
                 &index,
-                vec![input_name.to_string()],
+                current_path,
+                excluded_inputs,
                 &mut vec![index.to_string()],
                 writer,
             );
@@ -378,16 +539,22 @@ fn traverse_and_print_config(
     root_inputs: &std::collections::HashSet<String>,
     current_node_index: &str,
     current_path: Vec<String>,
+    excluded_inputs: &InputPathExclusions,
     visited_indices: &mut Vec<String>, // To detect cycles in the current path
     writer: &mut impl Write,
 ) {
     let node = lock.get_node(current_node_index).expect("node exists");
 
     for (edge_name, edge) in node.iter_edges() {
+        let mut config_path = current_path.clone();
+        config_path.push(edge_name.to_string());
+
+        if excluded_inputs.excludes(&config_path) {
+            continue;
+        }
+
         // If the edge name matches a root input, print the config
         if root_inputs.contains(edge_name) {
-            let mut config_path = current_path.clone();
-            config_path.push(edge_name.to_string());
             // Construct string like B.inputs.C.inputs.nixpkgs.follows = "nixpkgs"
             // Path elements join with ".inputs."
             let path_str = config_path.join(".inputs.");
@@ -401,13 +568,12 @@ fn traverse_and_print_config(
         if let Some(child_index) = lock.resolve_edge(&edge) {
             if !visited_indices.contains(&child_index) {
                 visited_indices.push(child_index.clone());
-                let mut new_path = current_path.clone();
-                new_path.push(edge_name.to_string());
                 traverse_and_print_config(
                     lock,
                     root_inputs,
                     &child_index,
-                    new_path,
+                    config_path,
+                    excluded_inputs,
                     visited_indices,
                     writer,
                 );
@@ -416,7 +582,6 @@ fn traverse_and_print_config(
         }
     }
 }
-
 
 struct FlakeNodeVisits<'a> {
     inner: IndexMap<&'a str, u32>,
@@ -499,10 +664,256 @@ mod tests {
 
     static HYPRLAND_LOCK_NO_FOLLOWS: &str = "samples/hyprland/no-follows/flake.lock";
 
+    static PATH_EXCLUSION_LOCK: &str = r#"{
+      "nodes": {
+        "root": {
+          "inputs": {
+            "a": "a",
+            "b": "b",
+            "nixpkgs": "nixpkgs",
+            "flake-utils": "flake-utils"
+          }
+        },
+        "a": {
+          "inputs": {
+            "nixpkgs": "a-nixpkgs",
+            "flake-utils": "a-utils",
+            "middle": "middle"
+          }
+        },
+        "a-nixpkgs": {
+          "inputs": {
+            "flake-utils": "a-nixpkgs-utils"
+          }
+        },
+        "a-nixpkgs-utils": {
+          "inputs": {}
+        },
+        "a-utils": {
+          "inputs": {}
+        },
+        "middle": {
+          "inputs": {
+            "nixpkgs": "middle-nixpkgs",
+            "flake-utils": "middle-utils"
+          }
+        },
+        "middle-nixpkgs": {
+          "inputs": {}
+        },
+        "middle-utils": {
+          "inputs": {}
+        },
+        "b": {
+          "inputs": {
+            "nixpkgs": "b-nixpkgs",
+            "tool": "tool"
+          }
+        },
+        "b-nixpkgs": {
+          "inputs": {}
+        },
+        "tool": {
+          "inputs": {
+            "flake-utils": "tool-utils"
+          }
+        },
+        "tool-utils": {
+          "inputs": {}
+        },
+        "nixpkgs": {
+          "inputs": {}
+        },
+        "flake-utils": {
+          "inputs": {}
+        }
+      },
+      "root": "root",
+      "version": 7
+    }"#;
+
+    fn path_exclusion_lock() -> LockFile {
+        serde_json::from_str(PATH_EXCLUSION_LOCK).unwrap()
+    }
+
+    fn exclusions(paths: &[&str]) -> InputPathExclusions {
+        paths
+            .iter()
+            .map(|path| path.parse().unwrap())
+            .collect::<Vec<InputPath>>()
+            .into()
+    }
+
+    fn edge_at(lock: &LockFile, node_index: &str, input: &str) -> NodeEdge {
+        let node = lock
+            .get_node(node_index)
+            .unwrap_or_else(|| panic!("node {node_index} to exist"));
+        let edge = node
+            .get_edge(input)
+            .unwrap_or_else(|| panic!("node {node_index} to have input {input}"));
+        (*edge).clone()
+    }
+
+    fn assert_indexed(lock: &LockFile, node_index: &str, input: &str, expected_index: &str) {
+        assert_eq!(
+            edge_at(lock, node_index, input),
+            NodeEdge::Indexed(expected_index.to_string()),
+            "{node_index}.{input} should keep its indexed edge"
+        );
+    }
+
+    fn assert_follows(lock: &LockFile, node_index: &str, input: &str, expected_path: &[&str]) {
+        assert_eq!(
+            edge_at(lock, node_index, input),
+            NodeEdge::Follows(expected_path.iter().map(ToString::to_string).collect()),
+            "{node_index}.{input} should follow the root input"
+        );
+    }
+
+    #[test]
+    fn exclusion_preserves_transitive_input_and_descendant_closure_after_prune() {
+        let mut lock = path_exclusion_lock();
+        let excluded_inputs = exclusions(&["a/nixpkgs"]);
+
+        substitute_flake_inputs_with_follows(&lock, false, &excluded_inputs);
+        prune_orphan_nodes(&mut lock);
+
+        assert_indexed(&lock, "a", "nixpkgs", "a-nixpkgs");
+        assert_indexed(&lock, "a-nixpkgs", "flake-utils", "a-nixpkgs-utils");
+        assert!(
+            lock.get_node("a-nixpkgs").is_some(),
+            "excluded input target should remain reachable after prune"
+        );
+        assert!(
+            lock.get_node("a-nixpkgs-utils").is_some(),
+            "excluded input descendants should remain reachable after prune"
+        );
+
+        assert_follows(&lock, "a", "flake-utils", &["flake-utils"]);
+        assert_follows(&lock, "b", "nixpkgs", &["nixpkgs"]);
+        assert_follows(&lock, "tool", "flake-utils", &["flake-utils"]);
+        assert!(
+            lock.get_node("a-utils").is_none(),
+            "unexcluded replaced duplicate should be pruned"
+        );
+        assert!(
+            lock.get_node("b-nixpkgs").is_none(),
+            "unexcluded replaced duplicate should be pruned"
+        );
+        assert!(
+            lock.get_node("tool-utils").is_none(),
+            "unexcluded replaced duplicate descendant should be pruned"
+        );
+    }
+
+    #[test]
+    fn inputs_syntax_exclusion_matches_slash_syntax_for_substitution() {
+        let mut slash_lock = path_exclusion_lock();
+        let mut inputs_lock = path_exclusion_lock();
+        let slash_excluded = exclusions(&["a/nixpkgs"]);
+        let inputs_excluded = exclusions(&["a.inputs.nixpkgs"]);
+
+        slash_excluded.assert_resolvable(&slash_lock);
+        inputs_excluded.assert_resolvable(&inputs_lock);
+        substitute_flake_inputs_with_follows(&slash_lock, false, &slash_excluded);
+        substitute_flake_inputs_with_follows(&inputs_lock, false, &inputs_excluded);
+        prune_orphan_nodes(&mut slash_lock);
+        prune_orphan_nodes(&mut inputs_lock);
+
+        assert_eq!(
+            inputs_lock, slash_lock,
+            ".inputs. exclusion syntax should produce the same substituted lock as slash syntax"
+        );
+        assert_indexed(&inputs_lock, "a", "nixpkgs", "a-nixpkgs");
+        assert_indexed(&inputs_lock, "a-nixpkgs", "flake-utils", "a-nixpkgs-utils");
+        assert!(
+            inputs_lock.get_node("a-nixpkgs-utils").is_some(),
+            ".inputs. syntax should preserve the excluded subtree"
+        );
+        assert_follows(&inputs_lock, "b", "nixpkgs", &["nixpkgs"]);
+    }
+
+    #[test]
+    fn inputs_syntax_exclusion_matches_slash_syntax_for_config_output() {
+        use crate::print_flake_file_module;
+
+        let lock = path_exclusion_lock();
+        let slash_excluded = exclusions(&["a/middle"]);
+        let inputs_excluded = exclusions(&["a.inputs.middle"]);
+        let mut slash_buf = Vec::new();
+        let mut inputs_buf = Vec::new();
+
+        slash_excluded.assert_resolvable(&lock);
+        inputs_excluded.assert_resolvable(&lock);
+        print_flake_file_module(&lock, &slash_excluded, &mut slash_buf);
+        print_flake_file_module(&lock, &inputs_excluded, &mut inputs_buf);
+
+        let slash_output = String::from_utf8(slash_buf).unwrap();
+        let inputs_output = String::from_utf8(inputs_buf).unwrap();
+        assert_eq!(
+            inputs_output, slash_output,
+            ".inputs. exclusion syntax should omit the same config paths as slash syntax"
+        );
+        assert!(
+            !inputs_output
+                .lines()
+                .map(str::trim)
+                .any(|line| line == "a.inputs.middle.inputs.nixpkgs.follows = \"nixpkgs\";"),
+            ".inputs. syntax should exclude descendant config follows:\n{inputs_output}"
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "Excluded input path 'a/not-present' does not exist in the lock file"
+    )]
+    fn unresolved_excluded_path_is_rejected() {
+        exclusions(&["a/not-present"]).assert_resolvable(&path_exclusion_lock());
+    }
+
+    #[test]
+    fn config_exclusion_omits_excluded_paths_and_descendant_follows() {
+        use crate::print_flake_file_module;
+
+        let lock = path_exclusion_lock();
+        let excluded_inputs = exclusions(&["a/nixpkgs", "a/middle"]);
+        let mut buf = Vec::new();
+
+        print_flake_file_module(&lock, &excluded_inputs, &mut buf);
+
+        let output = String::from_utf8(buf).unwrap();
+        let lines = output.lines().map(str::trim).collect::<Vec<_>>();
+        assert!(
+            !lines.contains(&"a.inputs.nixpkgs.follows = \"nixpkgs\";"),
+            "excluded root-relative path should not be emitted:\n{output}"
+        );
+        assert!(
+            !lines.contains(&"a.inputs.middle.inputs.nixpkgs.follows = \"nixpkgs\";"),
+            "descendant follows below an excluded path should not be emitted:\n{output}"
+        );
+        assert!(
+            !lines.contains(&"a.inputs.middle.inputs.flake-utils.follows = \"flake-utils\";"),
+            "all descendant follows below an excluded path should be omitted:\n{output}"
+        );
+
+        assert!(
+            lines.contains(&"a.inputs.flake-utils.follows = \"flake-utils\";"),
+            "unexcluded sibling follows should still be emitted:\n{output}"
+        );
+        assert!(
+            lines.contains(&"b.inputs.nixpkgs.follows = \"nixpkgs\";"),
+            "unrelated root input follows should still be emitted:\n{output}"
+        );
+        assert!(
+            lines.contains(&"b.inputs.tool.inputs.flake-utils.follows = \"flake-utils\";"),
+            "unrelated descendant follows should still be emitted:\n{output}"
+        );
+    }
+
     #[test]
     fn prune_hyprland_flake_lock() {
         let mut lock = read_flake_lock(HYPRLAND_LOCK_NO_FOLLOWS.into());
-        substitute_flake_inputs_with_follows(&lock, false);
+        substitute_flake_inputs_with_follows(&lock, false, &InputPathExclusions::default());
         prune_orphan_nodes(&mut lock);
         insta::with_settings!(
             {
@@ -522,7 +933,7 @@ mod tests {
         use crate::print_flake_file_module;
         let lock = read_flake_lock(HYPRLAND_LOCK_NO_FOLLOWS.into());
         let mut buf = Vec::new();
-        print_flake_file_module(&lock, &mut buf);
+        print_flake_file_module(&lock, &InputPathExclusions::default(), &mut buf);
         let output = String::from_utf8(buf).unwrap();
         insta::with_settings!(
             {
